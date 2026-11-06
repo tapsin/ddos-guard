@@ -2,11 +2,12 @@
 # ddos-guard.sh
 # Mikrotik "stage" mantığının iptables + ipset karşılığı + genel DDoS/DNS önlemleri.
 #
-# İlk çalıştırmada KURULUM SİHİRBAZI açılır: beyaz listeyi ister, her komutun ne
-# yaptığını ve sonucunu açıklar, ayarları /etc/ddos-guard.conf dosyasına kaydeder.
+# İlk çalıştırmada KURULUM SİHİRBAZI açılır: beyaz liste, TCP ve UDP portları
+# sırayla sorulur, her komutun ne yaptığı açıklanır, ayarlar /etc/ddos-guard.conf'a yazılır.
 #
-# Komutlar (root):
-#   sudo ./ddos-guard.sh setup        -> kurulum sihirbazı (ayarlar + açıklama)
+# Komutlar (root gerektirenler sudo ile):
+#   sudo ./ddos-guard.sh setup        -> kurulum sihirbazı (beyaz liste + portlar + açıklama)
+#   sudo ./ddos-guard.sh ports        -> sadece portları yeniden seç (sıralı ekleme)
 #   sudo ./ddos-guard.sh apply        -> koruma kurallarını uygular
 #   sudo ./ddos-guard.sh remove       -> uygulanan kuralları kaldırır
 #   sudo ./ddos-guard.sh status       -> listeler, sayaçlar, DNS durumu
@@ -20,16 +21,19 @@ set -u
 CONF_FILE="/etc/ddos-guard.conf"
 CHAIN="DDOS_GUARD"
 FLOOD_CHAIN="ANTI_FLOOD"
-PORTS="22,80,443"
 DNS_PORT=53
 TIMEOUT_STAGE=60
 
 # Varsayılanlar (conf dosyası yoksa)
+WHITELIST_CSV="127.0.0.1"
 WHITELIST_IPS="127.0.0.1"
+PORTS_TCP_CSV="22,80,443"
+PORTS_UDP_CSV=""
 SYN_RATE="50/second"; SYN_BURST=100
 DNS_UDP_RATE="30/second"; DNS_UDP_BURST=60
 DNS_TCP_CONN=20
 ICMP_RATE="5/second"; ICMP_BURST=10
+UDP_RATE="100/second"; UDP_BURST=200
 NAMED_CONF_CANDIDATES="/etc/named.conf /etc/bind/named.conf.options"
 
 # ---------------------------------------------------------------
@@ -47,6 +51,7 @@ load_conf() {
         # shellcheck disable=SC1090
         . "$CONF_FILE"
     fi
+    WHITELIST_IPS="${WHITELIST_CSV//,/ }"
 }
 
 ask_yes_no() {
@@ -75,6 +80,168 @@ valid_ip_or_cidr() {
 }
 
 # ---------------------------------------------------------------
+# Portlar
+# ---------------------------------------------------------------
+# Dinleyen portları protokole göre (tcp/udp) ve süreç adlarıyla listeler.
+# $1 = tcp | udp
+list_ports() {
+    local proto="$1" flag
+    if [ "$proto" = "tcp" ]; then flag="-tlnpH"; else flag="-ulnpH"; fi
+    ss $flag 2>/dev/null | awk '{
+        n = split($4, a, ":"); port = a[n];
+        proc = "-";
+        if (match($0, /users:\(\("[^"]+"/)) { proc = substr($0, RSTART+9, RLENGTH-10) }
+        printf "%s\t%s\n", port, proc
+    }' | sort -n -u -k1,1 | awk -F'\t' '{ printf "  %-7s %s\n", $1, $2 }'
+}
+
+# Dinleyen tüm portları virgüllü CSV olarak verir (tcp | udp)
+all_listening_csv() {
+    local flag
+    if [ "$1" = "tcp" ]; then flag="-tlnH"; else flag="-ulnH"; fi
+    ss $flag 2>/dev/null | awk '{ n = split($4, a, ":"); print a[n] }' \
+        | grep -E '^[0-9]+$' | sort -n -u | paste -sd, -
+}
+
+# Sıralı port ekleme: her seferinde bir port, sıra korunur.
+# $1 = tcp | udp ; sonuç: PORTS_<PROTO>_CSV değişkenine yazılır.
+add_ports_sequential() {
+    local proto="$1" label input current="" count=0
+    label=$(echo "$proto" | tr 'a-z' 'A-Z')
+    echo
+    echo "=== $label PORTLARI ==="
+    echo "Sistemde şu an dinleyen $label portları:"
+    list_ports "$proto"
+    echo
+    echo "Portları sırayla girin, her seferinde bir port. Bitirmek için boş Enter."
+    while true; do
+        read -r -p "$label port ekle (boş = bitir): " input
+        input="$(echo "$input" | tr -d ' ')"
+        [ -z "$input" ] && break
+        if ! [[ "$input" =~ ^[0-9]{1,5}$ ]] || [ "$input" -lt 1 ] || [ "$input" -gt 65535 ]; then
+            echo "  Geçersiz port: '$input' (1-65535 arası olmalı)."
+            continue
+        fi
+        if echo ",$current," | grep -q ",$input,"; then
+            echo "  $input zaten seçili."
+            continue
+        fi
+        current="${current:+$current,}$input"
+        count=$((count + 1))
+        echo "  Seçili $label portları (sırayla): $current"
+    done
+    eval "PORTS_${label}_CSV=\"\$current\""
+}
+
+# Boş bırakılan TCP/UDP listesi için risk açıklaması ve "tümüne uygula" seçeneği.
+# $1 = tcp | udp
+offer_all_ports() {
+    local proto="$1" label all
+    label=$(echo "$proto" | tr 'a-z' 'A-Z')
+    all=$(all_listening_csv "$proto")
+    echo
+    echo "$label portu seçmediniz."
+    if [ -z "$all" ]; then
+        echo "Sistemde dinleyen $label portu bulunamadı; bu protokol için koruma uygulanmayacak."
+        eval "PORTS_${label}_CSV=\"\""
+        return
+    fi
+    echo "Sistemde dinleyen $label portları: $all"
+    echo
+    echo "RİSKLER (tüm $label portlarına uygularsanız):"
+    if [ "$proto" = "tcp" ]; then
+        echo "  - Dinleyen TÜM TCP portları kademeli engelleme (stage) kurallarına girer."
+        echo "  - Mail (25/465/587/993), panel, veritabanı veya sürekli bağlanan uygulamalar"
+        echo "    meşru olarak çok bağlantı açabilir; bunlar yanlışlıkla SÜRESİZ banlanabilir."
+        echo "  - 53 (DNS) dahilse DNS sorguları da bu kurallara tabi olur."
+        echo "  - Beyaz listede olmayan kendi bağlantınız da engellenebilir."
+    else
+        echo "  - Dinleyen TÜM UDP portlarına kaynak IP başına paket hızı sınırı uygulanır."
+        echo "  - DNS (53) ve QUIC/HTTP3 (443/udp) gibi yoğun UDP trafiği sınırlanabilir."
+    fi
+    echo "  - Bu portlar sistemde bir süreç tarafından dinlenen portlardır; giden (dış) bağlantılar etkilenmez."
+    echo
+    if ask_yes_no "Tüm dinleyen $label portlarına ($all) uygulansın mı?"; then
+        eval "PORTS_${label}_CSV=\"\$all\""
+    else
+        if [ "$proto" = "tcp" ]; then
+            eval "PORTS_TCP_CSV=\"22,80,443\""
+            echo "Varsayılan TCP listesi kullanılacak: 22,80,443"
+        else
+            eval "PORTS_UDP_CSV=\"\""
+            echo "UDP için koruma uygulanmayacak."
+        fi
+    fi
+}
+
+# Kullanıcıdan TCP ve UDP portlarını sırayla ister.
+ask_ports() {
+    echo
+    echo "=== KORUNACAK PORTLAR ==="
+    echo "TCP portları: yeni bağlantılar kademeli engelleme (stage) + anti-flood'dan geçer,"
+    echo "              aşırı bağlantı açan IP'ler SÜRESİZ banlanır."
+    echo "UDP portları: kaynak IP başına paket hızı sınırlanır (stage yok)."
+    echo "Önce TCP, sonra UDP sorulacak."
+
+    add_ports_sequential tcp
+    if [ -z "$PORTS_TCP_CSV" ]; then
+        offer_all_ports tcp
+    fi
+
+    add_ports_sequential udp
+    if [ -z "$PORTS_UDP_CSV" ]; then
+        offer_all_ports udp
+    fi
+
+    if echo ",$PORTS_TCP_CSV,$PORTS_UDP_CSV," | grep -q ",53,"; then
+        echo "UYARI: 53 (DNS) seçili. DNS trafiğini etkileyebilir; DNS için ayrı hız sınırı zaten var."
+    fi
+
+    echo
+    echo "Seçilen TCP portları : ${PORTS_TCP_CSV:-(yok)}"
+    echo "Seçilen UDP portları : ${PORTS_UDP_CSV:-(yok)}"
+}
+
+# Port listesini 15'lik parçalara böler (iptables multiport sınırı).
+# Her parça ayrı satırda yazılır.
+port_chunks() {
+    local csv="$1"
+    [ -z "$csv" ] && return
+    echo "$csv" | tr ',' '\n' | awk 'NF {
+        buf = buf (n ? "," : "") $0; n++
+        if (n == 15) { print buf; buf = ""; n = 0 }
+    } END { if (n) print buf }'
+}
+
+# Ayar dosyasını yazar (beyaz liste ve portlar).
+write_conf() {
+    cat > "$CONF_FILE" << EOF
+# ddos-guard.sh ayarları (kurulum tarafından oluşturuldu)
+# Beyaz liste (virgülle ayrılmış): kısıtlanmayacak IP / CIDR'ler
+WHITELIST_CSV="$WHITELIST_CSV"
+# Korunacak TCP portları (sırayla seçilmiş, virgülle ayrılmış)
+PORTS_TCP_CSV="$PORTS_TCP_CSV"
+# Korunacak UDP portları (sırayla seçilmiş, virgülle ayrılmış; boş olabilir)
+PORTS_UDP_CSV="$PORTS_UDP_CSV"
+EOF
+    chmod 600 "$CONF_FILE"
+}
+
+ports_cmd() {
+    need_root ports
+    load_conf
+    ask_ports
+    write_conf
+    echo
+    echo "Portlar kaydedildi: $CONF_FILE"
+    if ask_yes_no "Yeni port listesi şimdi uygulansın mı (apply)?"; then
+        apply
+    else
+        echo "Uygulanmadı. Daha sonra: sudo $0 apply"
+    fi
+}
+
+# ---------------------------------------------------------------
 # Kurulum sihirbazı
 # ---------------------------------------------------------------
 explain_commands() {
@@ -82,34 +249,39 @@ cat << 'EOF'
 ------------------------------------------------------------
  Bu script ne yapar ve komutlar ne yapar?
 ------------------------------------------------------------
+ setup       Kurulum sihirbazı: beyaz liste, TCP ve UDP portları (sırayla) ve
+             ayarların kaydı. Sonunda apply'ı isteğe bağlı çalıştırır.
+             Sonuç: /etc/ddos-guard.conf oluşur; sistem henüz değişmez (apply istenirse).
+
+ ports       Sadece portları yeniden seçer (sıralı ekleme). Sonra apply sorulur.
+             Sonuç: yeni port listesi kaydedilir.
+
  apply       Güvenlik duvarına (iptables) koruma kuralları ekler.
-             - 22/80/443 için: bir IP kısa sürede çok yeni bağlantı açarsa
-               önce geçici listeye (60 sn), tekrarlarsa kademe kademe yükselir.
-               En üst kademede IP SÜRESİZ engellenir.
-             - SYN flood, ping (ICMP) flood ve DNS (53) hız sınırı uygular.
+             - Seçilen TCP portlarına gelen yeni bağlantılar kademeli engellemeden geçer:
+               60 sn geçici liste, tekrarlarsa kademe kademe yükselir; en üstte SÜRESİZ ban.
+             - SYN flood, ping flood ve DNS (53) hız sınırı uygular.
+             - Seçilen UDP portlarına kaynak IP başına paket hızı sınırı uygular.
              - Beyaz listedeki IP'lere hiçbir kısıtlama uygulanmaz.
              Sonuç: normal kullanıcılar etkilenmez; saldırgan IP'ler düşürülür.
 
  remove      apply ile eklenen tüm kuralları ve listeleri siler.
              Sonuç: koruma kalkar, sunucu eski haline döner.
 
- status      Hangi IP'lerin engellendiğini ve kaç paket düşürüldüğünü gösterir.
-             Sonuç: sadece görüntüler, değişiklik yapmaz.
+ status      Engellenen IP'leri ve düşürülen paket sayısını gösterir. Değişiklik yapmaz.
 
  unban IP    Süresiz engellenmiş bir IP'yi listeden çıkarır.
              Sonuç: o IP tekrar bağlanabilir.
 
- dns-check   named (DNS) ayarında özyineleme (recursion) kimlere açık, gösterir.
-             Sonuç: sadece görüntüler, değişiklik yapmaz.
+ dns-check   named (DNS) özyineleme ayarını gösterir. Değişiklik yapmaz.
 
  harden-dns  named'da özyineleme yalnızca localhost'a açılır.
              Sunucu alan adlarını dış dünyaya çözmeye DEVAM EDER (yetkili yanıtlar
-             etkilenmez). Sadece dışarıdaki kişilerin sunucuyu DNS yükseltmesi için
-             kullanmasını engeller. Önce yedek alır, doğrular, hata olursa geri döner.
+             etkilenmez). Önce yedek alır, doğrular, hata olursa geri döner.
              Sonuç: DNS amplifikasyon (yansıtma) saldırılarına karşı riski azaltır.
 
  Uyarı: apply ve harden-dns sunucuda gerçek değişiklik yapar. Beyaz listenize
         kendi IP'nizi eklemeyi unutmayın; aksi halde kendinizi kilitleyebilirsiniz.
+        Port boş bırakılırsa tüm açık portlara uygulanabilir; bu riskler setup'ta gösterilir.
 ------------------------------------------------------------
 EOF
 }
@@ -126,14 +298,12 @@ setup() {
     echo "Boş bırakırsanız sadece 127.0.0.1 eklenir."
     echo
 
-    local input ip list=()
+    local input ip ok parts=() list=() uniq
     while true; do
         read -r -p "Beyaz liste IP'leri: " input
         list=()
-        local ok=1
-        if [ -z "$(echo "$input" | tr -d ' ')" ]; then
-            break
-        fi
+        ok=1
+        [ -z "$(echo "$input" | tr -d ' ')" ] && break
         IFS=',' read -ra parts <<< "$input"
         for p in "${parts[@]}"; do
             ip="$(echo "$p" | tr -d ' ')"
@@ -149,22 +319,16 @@ setup() {
         [ $ok -eq 1 ] && break
     done
 
-    # 127.0.0.1 her zaman ekli olsun
     list+=("127.0.0.1")
-    # tekrarları kaldır
-    local uniq
     uniq=$(printf '%s\n' "${list[@]}" | awk '!seen[$0]++' | paste -sd, -)
-    WHITELIST_IPS=$(echo "$uniq" | tr ',' ' ')
+    WHITELIST_CSV="$uniq"
 
     echo
     echo "Kaydedilecek beyaz liste: $uniq"
-    cat > "$CONF_FILE" << EOF
-# ddos-guard.sh ayarları (setup tarafından oluşturuldu)
-# Beyaz liste (virgülle ayrılmış): kısıtlanmayacak IP / CIDR'ler
-WHITELIST_CSV="$uniq"
-WHITELIST_IPS="\${WHITELIST_CSV//,/ }"
-EOF
-    chmod 600 "$CONF_FILE"
+
+    ask_ports
+    write_conf
+    echo
     echo "Ayarlar kaydedildi: $CONF_FILE (sadece root okuyabilir)"
     echo
 
@@ -202,13 +366,18 @@ apply_stage() {
 }
 
 apply_flood() {
+    local chunk
     iptables -N "$FLOOD_CHAIN" 2>/dev/null || iptables -F "$FLOOD_CHAIN"
     iptables -A "$FLOOD_CHAIN" -m set --match-set whitelist src -j RETURN
     iptables -A "$FLOOD_CHAIN" -m conntrack --ctstate INVALID -j DROP
     iptables -A "$FLOOD_CHAIN" -f -j DROP
-    iptables -A "$FLOOD_CHAIN" -p tcp -m multiport --dports "$PORTS" --syn \
-        -m hashlimit --hashlimit-name syn_flood --hashlimit-mode srcip \
-        --hashlimit-above "$SYN_RATE" --hashlimit-burst "$SYN_BURST" -j DROP
+    # SYN flood: seçili TCP portları (15'lik parçalar halinde)
+    while read -r chunk; do
+        [ -z "$chunk" ] && continue
+        iptables -A "$FLOOD_CHAIN" -p tcp -m multiport --dports "$chunk" --syn \
+            -m hashlimit --hashlimit-name syn_flood --hashlimit-mode srcip \
+            --hashlimit-above "$SYN_RATE" --hashlimit-burst "$SYN_BURST" -j DROP
+    done < <(port_chunks "$PORTS_TCP_CSV")
     iptables -A "$FLOOD_CHAIN" -p icmp --icmp-type echo-request \
         -m limit --limit "$ICMP_RATE" --limit-burst "$ICMP_BURST" -j RETURN
     iptables -A "$FLOOD_CHAIN" -p icmp --icmp-type echo-request -j DROP
@@ -217,14 +386,39 @@ apply_flood() {
         --hashlimit-above "$DNS_UDP_RATE" --hashlimit-burst "$DNS_UDP_BURST" -j DROP
     iptables -A "$FLOOD_CHAIN" -p tcp --dport "$DNS_PORT" --syn \
         -m connlimit --connlimit-above "$DNS_TCP_CONN" --connlimit-mask 32 -j DROP
+    # Seçili UDP portları: kaynak IP başına paket hızı sınırı (15'lik parçalar)
+    while read -r chunk; do
+        [ -z "$chunk" ] && continue
+        iptables -A "$FLOOD_CHAIN" -p udp -m multiport --dports "$chunk" \
+            -m hashlimit --hashlimit-name udp_guard --hashlimit-mode srcip \
+            --hashlimit-above "$UDP_RATE" --hashlimit-burst "$UDP_BURST" -j DROP
+    done < <(port_chunks "$PORTS_UDP_CSV")
     iptables -A "$FLOOD_CHAIN" -j RETURN
 }
 
+# DDOS_GUARD'a giden atlama kurallarını (her TCP parçası için) ekler/siler
 link_chains() {
+    local chunk
     iptables -D INPUT -j "$FLOOD_CHAIN" 2>/dev/null
-    iptables -D INPUT -p tcp -m multiport --dports "$PORTS" -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null
-    iptables -I INPUT 1 -p tcp -m multiport --dports "$PORTS" -m conntrack --ctstate NEW -j "$CHAIN"
+    while read -r chunk; do
+        [ -z "$chunk" ] && continue
+        iptables -D INPUT -p tcp -m multiport --dports "$chunk" -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null
+    done < <(port_chunks "$PORTS_TCP_CSV")
+    while read -r chunk; do
+        [ -z "$chunk" ] && continue
+        iptables -I INPUT 1 -p tcp -m multiport --dports "$chunk" -m conntrack --ctstate NEW -j "$CHAIN"
+    done < <(port_chunks "$PORTS_TCP_CSV")
     iptables -I INPUT 1 -j "$FLOOD_CHAIN"
+}
+
+warn_fw() {
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "UYARI: ufw aktif. Kurallar INPUT zincirine eklenir; ufw reload sonrası kontrol edin."
+    elif [ -d /usr/local/csf ]; then
+        echo "UYARI: CSF kurulu. 'csf -r' iptables kurallarını silebilir."
+    elif [ -d /etc/apf ]; then
+        echo "UYARI: APF kurulu. 'apf -r' iptables kurallarını silebilir."
+    fi
 }
 
 apply() {
@@ -236,31 +430,27 @@ apply() {
     apply_flood
     link_chains
     echo "Koruma uygulandı."
-    echo "  Stage kademeleri : 22/80/443 (60 sn, sonra süresiz ban)"
+    echo "  Stage kademeleri : TCP ${PORTS_TCP_CSV:-(yok)} (60 sn, sonra süresiz ban)"
+    echo "  UDP korumalı     : ${PORTS_UDP_CSV:-(yok)}"
     echo "  Anti-flood       : SYN $SYN_RATE, ICMP $ICMP_RATE, DNS UDP $DNS_UDP_RATE, DNS TCP $DNS_TCP_CONN bağlantı"
-    echo "  Beyaz liste      : $WHITELIST_IPS"
+    echo "  Beyaz liste      : $WHITELIST_CSV"
 }
 
 remove() {
     need_root remove
+    load_conf
+    local chunk
     iptables -D INPUT -j "$FLOOD_CHAIN" 2>/dev/null
-    iptables -D INPUT -p tcp -m multiport --dports "$PORTS" -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null
+    while read -r chunk; do
+        [ -z "$chunk" ] && continue
+        iptables -D INPUT -p tcp -m multiport --dports "$chunk" -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null
+    done < <(port_chunks "$PORTS_TCP_CSV")
     iptables -F "$FLOOD_CHAIN" 2>/dev/null; iptables -X "$FLOOD_CHAIN" 2>/dev/null
     iptables -F "$CHAIN" 2>/dev/null;       iptables -X "$CHAIN" 2>/dev/null
     for s in stage1 stage2 stage3 stage4 blocked whitelist; do
         ipset destroy "$s" 2>/dev/null
     done
     echo "Koruma kaldırıldı."
-}
-
-warn_fw() {
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        echo "UYARI: ufw aktif. Kurallar INPUT zincirine eklenir; ufw reload sonrası kontrol edin."
-    elif [ -d /usr/local/csf ]; then
-        echo "UYARI: CSF kurulu. 'csf -r' iptables kurallarını silebilir."
-    elif [ -d /etc/apf ]; then
-        echo "UYARI: APF kurulu. 'apf -r' iptables kurallarını silebilir."
-    fi
 }
 
 # ---------------------------------------------------------------
@@ -372,6 +562,7 @@ help() {
 # ---------------------------------------------------------------
 case "${1:-}" in
     setup)      setup ;;
+    ports)      ports_cmd ;;
     apply)      apply ;;
     remove)     remove ;;
     status)     status ;;
@@ -388,7 +579,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        echo "Kullanım: $0 {setup|apply|remove|status|unban IP|dns-check|harden-dns|help}"
+        echo "Kullanım: $0 {setup|ports|apply|remove|status|unban IP|dns-check|harden-dns|help}"
         exit 1
         ;;
 esac
